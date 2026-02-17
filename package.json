@@ -1,0 +1,17 @@
+{
+  "name": "ffxidat-to-spritesheet",
+  "version": "1.0.0",
+  "description": "Extract item icons from FFXI DAT files and generate sprite sheets",
+  "main": "generate.cjs",
+  "bin": {
+    "ffxidat-to-spritesheet": "generate.cjs"
+  },
+  "scripts": {
+    "generate": "node generate.cjs"
+  },
+  "keywords": ["ffxi", "final-fantasy-xi", "sprites", "icons", "dat"],
+  "license": "MIT",
+  "dependencies": {
+    "sharp": "^0.34.5"
+  }
+}
