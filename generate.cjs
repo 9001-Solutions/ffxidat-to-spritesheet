@@ -174,11 +174,191 @@ function extractIcon(record) {
 }
 
 // ---------------------------------------------------------------------------
-// Scan all item DATs and extract icons into memory
+// Item type classification by ID range
 // ---------------------------------------------------------------------------
 
-function extractAllIcons(ffxiDir, ftable) {
-  const icons = new Map(); // itemId → RGBA Buffer
+function isEquippable(itemId) {
+  // Weapon: 0x4000–0x5A00, Armor: 0x2800–0x4000 or 0x5A00–0x7000
+  return (
+    (itemId >= 0x4000 && itemId < 0x5a00) ||
+    (itemId >= 0x2800 && itemId < 0x4000) ||
+    (itemId >= 0x5a00 && itemId < 0x7000)
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Job / Race bitmask formatting
+// ---------------------------------------------------------------------------
+
+const JOB_BITS = [
+  [0x02, "WAR"], [0x04, "MNK"], [0x08, "WHM"], [0x10, "BLM"],
+  [0x20, "RDM"], [0x40, "THF"], [0x80, "PLD"], [0x100, "DRK"],
+  [0x200, "BST"], [0x400, "BRD"], [0x800, "RNG"], [0x1000, "SAM"],
+  [0x2000, "NIN"], [0x4000, "DRG"], [0x8000, "SMN"], [0x10000, "BLU"],
+  [0x20000, "COR"], [0x40000, "PUP"], [0x80000, "DNC"], [0x100000, "SCH"],
+  [0x200000, "GEO"], [0x400000, "RUN"],
+];
+const ALL_JOBS = 0x007ffffe;
+
+function formatJobs(bitmask) {
+  if ((bitmask & ALL_JOBS) === ALL_JOBS) return "All Jobs";
+  const jobs = [];
+  for (const [bit, name] of JOB_BITS) {
+    if (bitmask & bit) jobs.push(name);
+  }
+  return jobs.join("/");
+}
+
+const RACE_PAIRS = [
+  { m: 0x02, f: 0x04, name: "Hume" },
+  { m: 0x08, f: 0x10, name: "Elvaan" },
+  { m: 0x20, f: 0x40, name: "Taru" },
+];
+const ALL_RACES = 0x01fe;
+
+function formatRaces(bitmask) {
+  if ((bitmask & ALL_RACES) === ALL_RACES) return "All Races";
+  const parts = [];
+  for (const { m, f, name } of RACE_PAIRS) {
+    const hasM = !!(bitmask & m);
+    const hasF = !!(bitmask & f);
+    if (hasM && hasF) parts.push(name);
+    else if (hasM) parts.push(name + "\u2642");
+    else if (hasF) parts.push(name + "\u2640");
+  }
+  if (bitmask & 0x80) parts.push("Mithra");
+  if (bitmask & 0x100) parts.push("Galka");
+  return parts.join("/");
+}
+
+// ---------------------------------------------------------------------------
+// Item name extraction from a decrypted item record
+// ---------------------------------------------------------------------------
+
+function readNullTermString(buf, offset, maxLen) {
+  let end = offset;
+  const limit = Math.min(offset + maxLen, buf.length);
+  while (end < limit && buf[end] !== 0) end++;
+  return buf.subarray(offset, end).toString("ascii");
+}
+
+function extractItemName(record) {
+  // Find string table header: [numEntries=5(u32)] [headerSize=0x2C(u32)]
+  let stOff = -1;
+  for (let off = 0; off < 0x80; off += 4) {
+    if (record.readUInt32LE(off) === 5 && record.readUInt32LE(off + 4) === 0x2c) {
+      stOff = off;
+      break;
+    }
+  }
+  if (stOff < 0) return "";
+
+  const dataStart = stOff + 0x2c;
+  const e2RelOff = record.readUInt32LE(stOff + 0x1c);
+  const nameAreaEnd = stOff + e2RelOff;
+
+  for (let j = dataStart; j < nameAreaEnd && j < record.length; j++) {
+    if (record[j] >= 0x20 && record[j] <= 0x7e) {
+      return readNullTermString(record, j, Math.min(32, nameAreaEnd - j));
+    }
+  }
+  return "";
+}
+
+// ---------------------------------------------------------------------------
+// Log name extraction from a decrypted item record (entry 1: English log singular)
+// ---------------------------------------------------------------------------
+
+function extractLogName(record) {
+  let stOff = -1;
+  for (let off = 0; off < 0x80; off += 4) {
+    if (record.readUInt32LE(off) === 5 && record.readUInt32LE(off + 4) === 0x2c) {
+      stOff = off;
+      break;
+    }
+  }
+  if (stOff < 0) return "";
+
+  // Entry 1 starts at offset stored at stOff + 0x0C, bounded by entry 2 at stOff + 0x1C
+  const e1RelOff = record.readUInt32LE(stOff + 0x0c);
+  const e2RelOff = record.readUInt32LE(stOff + 0x1c);
+  const logStart = stOff + e1RelOff;
+  const logEnd = stOff + e2RelOff;
+
+  for (let j = logStart; j < logEnd && j < record.length; j++) {
+    if (record[j] >= 0x20 && record[j] <= 0x7e) {
+      return readNullTermString(record, j, Math.min(64, logEnd - j));
+    }
+  }
+  return "";
+}
+
+// ---------------------------------------------------------------------------
+// Item description extraction from a decrypted item record
+// ---------------------------------------------------------------------------
+
+function extractDescription(record) {
+  // Find string table header same as extractItemName
+  let stOff = -1;
+  for (let off = 0; off < 0x80; off += 4) {
+    if (record.readUInt32LE(off) === 5 && record.readUInt32LE(off + 4) === 0x2c) {
+      stOff = off;
+      break;
+    }
+  }
+  if (stOff < 0) return "";
+
+  // String table entry[3] offset at stOff + 0x24 (from ResourceExtractor layout)
+  if (stOff + 0x24 + 4 > record.length) return "";
+  const descRelOff = record.readUInt32LE(stOff + 0x24);
+  const descStart = stOff + descRelOff;
+  if (descStart >= record.length) return "";
+
+  // Scan for printable ASCII
+  for (let j = descStart; j < record.length; j++) {
+    if (record[j] >= 0x20 && record[j] <= 0x7e) {
+      return readNullTermString(record, j, Math.min(256, record.length - j));
+    }
+  }
+  return "";
+}
+
+// ---------------------------------------------------------------------------
+// Item flags extraction (Rare / Ex)
+// ---------------------------------------------------------------------------
+
+function extractFlags(record) {
+  const flags = record.readUInt16LE(0x04);
+  return {
+    rare: !!(flags & 0x8000),
+    ex: !!(flags & 0x4000),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Equipment metadata extraction
+// ---------------------------------------------------------------------------
+
+function extractEquipMeta(record, itemId) {
+  if (!isEquippable(itemId)) return { jobs: "", level: 0, races: "" };
+
+  const level = record.readUInt16LE(0x0e);
+  const races = record.readUInt16LE(0x12);
+  const jobs = record.readUInt32LE(0x14);
+
+  return {
+    jobs: formatJobs(jobs),
+    level,
+    races: formatRaces(races),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Scan all item DATs and extract items into memory
+// ---------------------------------------------------------------------------
+
+function extractAllItems(ffxiDir, ftable) {
+  const items = new Map(); // itemId → { rgba, name, logName, description, rare, ex, jobs, level, races }
 
   for (const fileId of FILE_IDS) {
     const datPath = getPath(ffxiDir, ftable, fileId);
@@ -202,7 +382,12 @@ function extractAllIcons(ffxiDir, ftable) {
 
       const rgba = extractIcon(record);
       if (rgba) {
-        icons.set(itemId, rgba);
+        const name = extractItemName(record);
+        const logName = extractLogName(record);
+        const description = extractDescription(record);
+        const { rare, ex } = extractFlags(record);
+        const { jobs, level, races } = extractEquipMeta(record, itemId);
+        items.set(itemId, { rgba, name, logName, description, rare, ex, jobs, level, races });
         found++;
       }
     }
@@ -210,15 +395,15 @@ function extractAllIcons(ffxiDir, ftable) {
     console.log(`  0x${fileId.toString(16).padStart(4, "0")}: ${recordCount} records, ${found} icons`);
   }
 
-  return icons;
+  return items;
 }
 
 // ---------------------------------------------------------------------------
 // Generate chunked sprite sheets
 // ---------------------------------------------------------------------------
 
-async function generateSheets(icons, outputDir) {
-  const sortedIds = [...icons.keys()].sort((a, b) => a - b);
+async function generateSheets(items, outputDir) {
+  const sortedIds = [...items.keys()].sort((a, b) => a - b);
   const sheetCount = Math.ceil(sortedIds.length / ITEMS_PER_SHEET);
 
   console.log(`\nGenerating ${sheetCount} sprite sheet(s) for ${sortedIds.length} icons...`);
@@ -241,8 +426,9 @@ async function generateSheets(icons, outputDir) {
       const itemId = chunk[i];
       const col = i % COLS;
       const row = Math.floor(i / COLS);
+      const item = items.get(itemId);
 
-      const pngBuf = await sharp(icons.get(itemId), {
+      const pngBuf = await sharp(item.rgba, {
         raw: { width: ICON_SIZE, height: ICON_SIZE, channels: 4 },
       })
         .png()
@@ -254,8 +440,8 @@ async function generateSheets(icons, outputDir) {
         top: row * ICON_SIZE,
       });
 
-      sheetManifest[itemId] = [col, row];
-      globalItems[itemId] = [slug, col, row];
+      sheetManifest[itemId] = [col, row, item.name, item.logName, item.description, item.rare, item.ex, item.jobs, item.level, item.races];
+      globalItems[itemId] = [slug, col, row, item.name, item.logName, item.description, item.rare, item.ex, item.jobs, item.level, item.races];
     }
 
     await sharp({
@@ -304,11 +490,11 @@ async function main() {
   console.log("Reading FTABLE.DAT...");
   const ftable = readFtable(ffxiDir);
 
-  console.log("Extracting icons from DAT files...");
-  const icons = extractAllIcons(ffxiDir, ftable);
-  console.log(`\nTotal: ${icons.size} icons extracted`);
+  console.log("Extracting items from DAT files...");
+  const items = extractAllItems(ffxiDir, ftable);
+  console.log(`\nTotal: ${items.size} items extracted`);
 
-  await generateSheets(icons, outputDir);
+  await generateSheets(items, outputDir);
 
   console.log("\nDone!");
 }
