@@ -181,14 +181,27 @@ function extractIcon(record) {
 // Item type classification by ID range
 // ---------------------------------------------------------------------------
 
+function isWeapon(itemId) {
+  return itemId >= 0x4000 && itemId < 0x5a00;
+}
+
 function isEquippable(itemId) {
   // Weapon: 0x4000–0x5A00, Armor: 0x2800–0x4000 or 0x5A00–0x7000
   return (
-    (itemId >= 0x4000 && itemId < 0x5a00) ||
+    isWeapon(itemId) ||
     (itemId >= 0x2800 && itemId < 0x4000) ||
     (itemId >= 0x5a00 && itemId < 0x7000)
   );
 }
+
+const WEAPON_SKILLS = {
+  0x01: "Hand-to-Hand", 0x02: "Dagger", 0x03: "Sword", 0x04: "Great Sword",
+  0x05: "Axe", 0x06: "Great Axe", 0x07: "Scythe", 0x08: "Polearm",
+  0x09: "Katana", 0x0a: "Great Katana", 0x0b: "Club", 0x0c: "Staff",
+  0x19: "Archery", 0x1a: "Marksmanship", 0x1b: "Throwing",
+  0x29: "String Instrument", 0x2a: "Wind Instrument", 0x2d: "Handbell",
+  0x30: "Fishing",
+};
 
 // ---------------------------------------------------------------------------
 // Job / Race bitmask formatting
@@ -441,18 +454,25 @@ function extractFlags(record) {
 // ---------------------------------------------------------------------------
 
 function extractEquipMeta(record, itemId) {
-  if (!isEquippable(itemId)) return { jobs: "", level: 0, races: "", slot: "" };
+  if (!isEquippable(itemId)) return { jobs: "", level: 0, races: "", slot: "", weaponType: "" };
 
   const level = record.readUInt16LE(0x0e);
   const slots = record.readUInt16LE(0x10);
   const races = record.readUInt16LE(0x12);
   const jobs = record.readUInt32LE(0x14);
 
+  let weaponType = "";
+  if (isWeapon(itemId)) {
+    const skillByte = record.readUInt8(0x22);
+    weaponType = WEAPON_SKILLS[skillByte] || "";
+  }
+
   return {
     jobs: formatJobs(jobs),
     level,
     races: formatRaces(races),
     slot: formatSlots(slots),
+    weaponType,
   };
 }
 
@@ -461,7 +481,7 @@ function extractEquipMeta(record, itemId) {
 // ---------------------------------------------------------------------------
 
 function extractAllItems(ffxiDir, ftable, dumpBytes) {
-  const items = new Map(); // itemId → { rgba, name, logName, description, rare, ex, jobs, level, races, slot }
+  const items = new Map(); // itemId → { rgba, name, logName, description, rare, ex, jobs, level, races, slot, weaponType }
 
   for (const fileId of FILE_IDS) {
     const datPath = getPath(ffxiDir, ftable, fileId);
@@ -493,8 +513,8 @@ function extractAllItems(ffxiDir, ftable, dumpBytes) {
         const logName = extractLogName(record);
         const description = extractDescription(record);
         const { rare, ex } = extractFlags(record);
-        const { jobs, level, races, slot } = extractEquipMeta(record, itemId);
-        items.set(itemId, { rgba, name, logName, description, rare, ex, jobs, level, races, slot });
+        const { jobs, level, races, slot, weaponType } = extractEquipMeta(record, itemId);
+        items.set(itemId, { rgba, name, logName, description, rare, ex, jobs, level, races, slot, weaponType });
         found++;
       }
     }
@@ -547,8 +567,8 @@ async function generateSheets(items, outputDir) {
         top: row * ICON_SIZE,
       });
 
-      sheetManifest[itemId] = [col, row, item.name, item.logName, item.description, item.rare, item.ex, item.jobs, item.level, item.races, item.slot];
-      globalItems[itemId] = [slug, col, row, item.name, item.logName, item.description, item.rare, item.ex, item.jobs, item.level, item.races, item.slot];
+      sheetManifest[itemId] = [col, row, item.name, item.logName, item.description, item.rare, item.ex, item.jobs, item.level, item.races, item.slot, item.weaponType];
+      globalItems[itemId] = [slug, col, row, item.name, item.logName, item.description, item.rare, item.ex, item.jobs, item.level, item.races, item.slot, item.weaponType];
     }
 
     await sharp({
