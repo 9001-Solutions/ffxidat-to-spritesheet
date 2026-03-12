@@ -40,12 +40,15 @@ function parseArgs() {
   const args = process.argv.slice(2);
   let ffxiDir = process.env.FFXI_DIR || "";
   let outputDir = DEFAULT_OUTPUT_DIR;
+  let dumpBytes = null;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--ffxi-dir" && args[i + 1]) {
       ffxiDir = args[++i];
     } else if (args[i] === "--output-dir" && args[i + 1]) {
       outputDir = args[++i];
+    } else if (args[i] === "--dump-bytes" && args[i + 1]) {
+      dumpBytes = parseInt(args[++i], 10);
     } else if (args[i] === "--help" || args[i] === "-h") {
       console.log(
         "ffxidat-to-spritesheet\n\n" +
@@ -53,6 +56,7 @@ function parseArgs() {
           "Options:\n" +
           "  --ffxi-dir <path>    Path to FINAL FANTASY XI directory (or set FFXI_DIR)\n" +
           "  --output-dir <path>  Output directory (default: ./output)\n" +
+          "  --dump-bytes <id>    Hex-dump description bytes for a given item ID (diagnostic)\n" +
           "  -h, --help           Show this help\n\n" +
           "Example:\n" +
           '  node generate.cjs --ffxi-dir "C:\\Program Files\\FINAL FANTASY XI"\n' +
@@ -71,7 +75,7 @@ function parseArgs() {
     process.exit(1);
   }
 
-  return { ffxiDir, outputDir };
+  return { ffxiDir, outputDir, dumpBytes };
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +220,42 @@ const RACE_PAIRS = [
 ];
 const ALL_RACES = 0x01fe;
 
+// FFXI special-character icon map — 0xEF prefix followed by one of these bytes
+const ICON_MAP = {
+  0x1f: "Fire ", 0x20: "Ice ", 0x21: "Wind ", 0x22: "Earth ",
+  0x23: "Lightning ", 0x24: "Water ", 0x25: "Light ", 0x26: "Dark ",
+  // Element icons (alternate)
+  0x27: "Fire ", 0x28: "Ice ", 0x29: "Wind ", 0x2a: "Earth ",
+  0x2b: "Lightning ", 0x2c: "Water ", 0x2d: "Light ", 0x2e: "Dark ",
+};
+
+const SLOT_BITS = [
+  [0x0001, "Main"],
+  [0x0002, "Sub"],
+  [0x0004, "Range"],
+  [0x0008, "Ammo"],
+  [0x0010, "Head"],
+  [0x0020, "Body"],
+  [0x0040, "Hands"],
+  [0x0080, "Legs"],
+  [0x0100, "Feet"],
+  [0x0200, "Neck"],
+  [0x0400, "Waist"],
+  [0x8000, "Back"],
+];
+const SLOT_PAIR_EAR = 0x1800;
+const SLOT_PAIR_RING = 0x6000;
+
+function formatSlots(bitmask) {
+  const parts = [];
+  if (bitmask & SLOT_PAIR_EAR) parts.push("Ear");
+  if (bitmask & SLOT_PAIR_RING) parts.push("Ring");
+  for (const [bit, name] of SLOT_BITS) {
+    if (bitmask & bit) parts.push(name);
+  }
+  return parts.join("/");
+}
+
 function formatRaces(bitmask) {
   if ((bitmask & ALL_RACES) === ALL_RACES) return "All Races";
   const parts = [];
@@ -294,11 +334,42 @@ function extractLogName(record) {
 }
 
 // ---------------------------------------------------------------------------
+// FFXI string decoder — handles element/stat icon bytes in descriptions
+// ---------------------------------------------------------------------------
+
+function decodeFFXIString(buf, offset, maxLen) {
+  const parts = [];
+  const limit = Math.min(offset + maxLen, buf.length);
+  let i = offset;
+  while (i < limit) {
+    const b = buf[i];
+    if (b === 0x00) break;
+    if (b === 0xef && i + 1 < limit) {
+      const iconByte = buf[i + 1];
+      if (ICON_MAP[iconByte]) {
+        parts.push(ICON_MAP[iconByte]);
+      }
+      i += 2;
+    } else if (b === 0x0a || b === 0x0d) {
+      parts.push("\n");
+      // Skip \r\n pair
+      if (b === 0x0d && i + 1 < limit && buf[i + 1] === 0x0a) i++;
+      i++;
+    } else if (b >= 0x20 && b <= 0x7e) {
+      parts.push(String.fromCharCode(b));
+      i++;
+    } else {
+      i++;
+    }
+  }
+  return parts.join("");
+}
+
+// ---------------------------------------------------------------------------
 // Item description extraction from a decrypted item record
 // ---------------------------------------------------------------------------
 
-function extractDescription(record) {
-  // Find string table header same as extractItemName
+function findDescriptionStart(record) {
   let stOff = -1;
   for (let off = 0; off < 0x80; off += 4) {
     if (record.readUInt32LE(off) === 5 && record.readUInt32LE(off + 4) === 0x2c) {
@@ -306,21 +377,51 @@ function extractDescription(record) {
       break;
     }
   }
-  if (stOff < 0) return "";
+  if (stOff < 0) return -1;
 
-  // String table entry[3] offset at stOff + 0x24 (from ResourceExtractor layout)
-  if (stOff + 0x24 + 4 > record.length) return "";
+  if (stOff + 0x24 + 4 > record.length) return -1;
   const descRelOff = record.readUInt32LE(stOff + 0x24);
   const descStart = stOff + descRelOff;
-  if (descStart >= record.length) return "";
+  if (descStart >= record.length) return -1;
+  return descStart;
+}
 
-  // Scan for printable ASCII
-  for (let j = descStart; j < record.length; j++) {
-    if (record[j] >= 0x20 && record[j] <= 0x7e) {
-      return readNullTermString(record, j, Math.min(256, record.length - j));
-    }
+function extractDescription(record) {
+  const descStart = findDescriptionStart(record);
+  if (descStart < 0) return "";
+
+  // Scan past leading padding/header bytes to first printable or 0xEF byte
+  const limit = Math.min(descStart + 256, record.length);
+  let textStart = descStart;
+  while (textStart < limit) {
+    const b = record[textStart];
+    if ((b >= 0x20 && b <= 0x7e) || b === 0xef || b === 0x0a) break;
+    textStart++;
   }
-  return "";
+  if (textStart >= limit) return "";
+  return decodeFFXIString(record, textStart, limit - textStart);
+}
+
+function dumpDescriptionBytes(record, itemId) {
+  const descStart = findDescriptionStart(record);
+  if (descStart < 0) {
+    console.log(`Item ${itemId}: no description found`);
+    return;
+  }
+  const len = Math.min(256, record.length - descStart);
+  const slice = record.subarray(descStart, descStart + len);
+  console.log(`\nItem ${itemId} (0x${itemId.toString(16)}) — description bytes at offset 0x${descStart.toString(16)}:`);
+  for (let row = 0; row < len; row += 16) {
+    const hex = [];
+    const ascii = [];
+    for (let c = 0; c < 16 && row + c < len; c++) {
+      const b = slice[row + c];
+      hex.push(b.toString(16).padStart(2, "0"));
+      ascii.push(b >= 0x20 && b <= 0x7e ? String.fromCharCode(b) : ".");
+    }
+    console.log(`  ${(descStart + row).toString(16).padStart(4, "0")}  ${hex.join(" ").padEnd(48)}  ${ascii.join("")}`);
+  }
+  console.log(`\nDecoded: ${extractDescription(record)}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -340,9 +441,10 @@ function extractFlags(record) {
 // ---------------------------------------------------------------------------
 
 function extractEquipMeta(record, itemId) {
-  if (!isEquippable(itemId)) return { jobs: "", level: 0, races: "" };
+  if (!isEquippable(itemId)) return { jobs: "", level: 0, races: "", slot: "" };
 
   const level = record.readUInt16LE(0x0e);
+  const slots = record.readUInt16LE(0x10);
   const races = record.readUInt16LE(0x12);
   const jobs = record.readUInt32LE(0x14);
 
@@ -350,6 +452,7 @@ function extractEquipMeta(record, itemId) {
     jobs: formatJobs(jobs),
     level,
     races: formatRaces(races),
+    slot: formatSlots(slots),
   };
 }
 
@@ -357,8 +460,8 @@ function extractEquipMeta(record, itemId) {
 // Scan all item DATs and extract items into memory
 // ---------------------------------------------------------------------------
 
-function extractAllItems(ffxiDir, ftable) {
-  const items = new Map(); // itemId → { rgba, name, logName, description, rare, ex, jobs, level, races }
+function extractAllItems(ffxiDir, ftable, dumpBytes) {
+  const items = new Map(); // itemId → { rgba, name, logName, description, rare, ex, jobs, level, races, slot }
 
   for (const fileId of FILE_IDS) {
     const datPath = getPath(ffxiDir, ftable, fileId);
@@ -380,14 +483,18 @@ function extractAllItems(ffxiDir, ftable) {
       const itemId = record.readUInt16LE(0);
       if (itemId === 0 || itemId >= 0xf000) continue;
 
+      if (dumpBytes !== null && itemId === dumpBytes) {
+        dumpDescriptionBytes(record, itemId);
+      }
+
       const rgba = extractIcon(record);
       if (rgba) {
         const name = extractItemName(record);
         const logName = extractLogName(record);
         const description = extractDescription(record);
         const { rare, ex } = extractFlags(record);
-        const { jobs, level, races } = extractEquipMeta(record, itemId);
-        items.set(itemId, { rgba, name, logName, description, rare, ex, jobs, level, races });
+        const { jobs, level, races, slot } = extractEquipMeta(record, itemId);
+        items.set(itemId, { rgba, name, logName, description, rare, ex, jobs, level, races, slot });
         found++;
       }
     }
@@ -440,8 +547,8 @@ async function generateSheets(items, outputDir) {
         top: row * ICON_SIZE,
       });
 
-      sheetManifest[itemId] = [col, row, item.name, item.logName, item.description, item.rare, item.ex, item.jobs, item.level, item.races];
-      globalItems[itemId] = [slug, col, row, item.name, item.logName, item.description, item.rare, item.ex, item.jobs, item.level, item.races];
+      sheetManifest[itemId] = [col, row, item.name, item.logName, item.description, item.rare, item.ex, item.jobs, item.level, item.races, item.slot];
+      globalItems[itemId] = [slug, col, row, item.name, item.logName, item.description, item.rare, item.ex, item.jobs, item.level, item.races, item.slot];
     }
 
     await sharp({
@@ -481,7 +588,7 @@ async function generateSheets(items, outputDir) {
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const { ffxiDir, outputDir } = parseArgs();
+  const { ffxiDir, outputDir, dumpBytes } = parseArgs();
 
   console.log("FFXI Directory:", ffxiDir);
   console.log("Output:        ", outputDir);
@@ -491,8 +598,13 @@ async function main() {
   const ftable = readFtable(ffxiDir);
 
   console.log("Extracting items from DAT files...");
-  const items = extractAllItems(ffxiDir, ftable);
+  const items = extractAllItems(ffxiDir, ftable, dumpBytes);
   console.log(`\nTotal: ${items.size} items extracted`);
+
+  if (dumpBytes !== null) {
+    console.log("\n--dump-bytes mode: skipping sheet generation.");
+    return;
+  }
 
   await generateSheets(items, outputDir);
 

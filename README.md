@@ -31,6 +31,9 @@ FFXI_DIR="/path/to/FINAL FANTASY XI" node generate.cjs
 
 # Custom output directory (default: ./output)
 node generate.cjs --ffxi-dir "C:\ffxi\Game\SquareEnix\FINAL FANTASY XI" --output-dir ./sprites
+
+# Diagnostic: hex-dump description bytes for a specific item ID
+node generate.cjs --ffxi-dir "C:\path\to\FFXI" --dump-bytes 17659
 ```
 
 The `--ffxi-dir` should point to the directory containing `FTABLE.DAT` and the `ROM/` folder.
@@ -73,7 +76,12 @@ Each PNG is a 512x2048px grid of 32x32 icons (16 columns x 64 rows), compressed 
 }
 ```
 
-Each entry maps an item ID to `[sheetSlug, column, row]`. To display an icon in CSS:
+Each entry maps an item ID to `[sheetSlug, column, row, name, logName, description, rare, ex, jobs, level, races, slot]`.
+
+- `description` — decoded with special FFXI icon bytes (element resistances like Fire, Water, etc.) converted to text
+- `slot` — equipment slot for equippable items (e.g. "Head", "Ear", "Ring", "Main/Sub")
+
+To display an icon in CSS:
 
 ```css
 .icon {
